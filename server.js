@@ -3,6 +3,7 @@ const https = require('https');
 const http = require('http');
 const crypto = require('crypto');
 const FormData = require('form-data');
+const { MongoClient } = require('mongodb');
 const fetch = (...args) => import('node-fetch').then(({default: f}) => f(...args));
 
 const app = express();
@@ -18,9 +19,22 @@ const TELEGRAM_TOKEN   = process.env.TELEGRAM_BOT_TOKEN;
 const CLOUD_NAME       = process.env.CLOUDINARY_CLOUD_NAME;
 const CLOUD_API_KEY    = process.env.CLOUDINARY_API_KEY;
 const CLOUD_API_SECRET = process.env.CLOUDINARY_API_SECRET;
+const MONGODB_URI      = process.env.MONGODB_URI;
 const TELEGRAM_API     = `https://api.telegram.org/bot${TELEGRAM_TOKEN}`;
 const TELEGRAM_FILE    = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}`;
 
+// â”€â”€ MongoDB connection â”€â”€
+let db = null;
+async function getDb() {
+  if (db) return db;
+  const client = new MongoClient(MONGODB_URI);
+  await client.connect();
+  db = client.db('cheayouth');
+  console.log('MongoDB connected');
+  return db;
+}
+
+// â”€â”€ Helper: download file as buffer â”€â”€
 function downloadBuffer(url) {
   return new Promise((resolve, reject) => {
     const client = url.startsWith('https') ? https : http;
@@ -33,25 +47,16 @@ function downloadBuffer(url) {
   });
 }
 
-// Detect resource type for Cloudinary
 function getResourceType(mimeType) {
   if (!mimeType) return 'image';
   if (mimeType.startsWith('video/')) return 'video';
-  if (mimeType === 'application/pdf') return 'image'; // Cloudinary handles PDFs as image type
   return 'image';
 }
 
-// Get file extension from mime type
 function getExtension(mimeType) {
   const map = {
-    'image/jpeg': 'jpg',
-    'image/png': 'png',
-    'image/gif': 'gif',
-    'image/webp': 'webp',
-    'video/mp4': 'mp4',
-    'video/quicktime': 'mov',
-    'video/x-msvideo': 'avi',
-    'video/webm': 'webm',
+    'image/jpeg': 'jpg', 'image/png': 'png', 'image/gif': 'gif', 'image/webp': 'webp',
+    'video/mp4': 'mp4', 'video/quicktime': 'mov', 'video/webm': 'webm',
     'application/pdf': 'pdf'
   };
   return map[mimeType] || 'jpg';
@@ -66,7 +71,7 @@ async function uploadToCloudinary(buffer, filename, resourceType = 'image', ext 
   const form = new FormData();
   form.append('file', buffer, {
     filename: `${filename}.${ext}`,
-    contentType: resourceType === 'video' ? `video/${ext}` : (ext === 'pdf' ? 'application/pdf' : `image/${ext}`)
+    contentType: ext === 'pdf' ? 'application/pdf' : `${resourceType}/${ext}`
   });
   form.append('api_key', CLOUD_API_KEY);
   form.append('timestamp', timestamp);
@@ -79,83 +84,111 @@ async function uploadToCloudinary(buffer, filename, resourceType = 'image', ext 
     `https://api.cloudinary.com/v1_1/${CLOUD_NAME}/${resourceType}/upload`,
     { method: 'POST', body: form, headers: form.getHeaders() }
   );
-
   const text = await res.text();
   let data;
   try { data = JSON.parse(text); }
   catch(e) { throw new Error('Cloudinary bad response: ' + text.substring(0, 200)); }
-
   if (data.error) throw new Error('Cloudinary error: ' + data.error.message);
-  return { url: data.secure_url, type: resourceType };
+  return data.secure_url;
 }
 
-async function processFileFromTelegram(fileId, filename, mimeType) {
+async function saveToMongo(doc) {
+  try {
+    const database = await getDb();
+    await database.collection('media').insertOne(doc);
+  } catch (err) {
+    console.error('MongoDB save error:', err.message);
+  }
+}
+
+async function processFile(fileId, filename, mimeType, caption) {
   const fileRes = await fetch(`${TELEGRAM_API}/getFile?file_id=${fileId}`);
   const fileData = await fileRes.json();
-  if (!fileData.ok) throw new Error('Could not get file from Telegram');
+  if (!fileData.ok) throw new Error('Cannot get file from Telegram');
 
   const buffer = await downloadBuffer(`${TELEGRAM_FILE}/${fileData.result.file_path}`);
   const resourceType = getResourceType(mimeType);
   const ext = getExtension(mimeType);
-  return await uploadToCloudinary(buffer, filename, resourceType, ext);
+  const url = await uploadToCloudinary(buffer, filename, resourceType, ext);
+
+  await saveToMongo({
+    url,
+    filename,
+    caption: caption || '',
+    type: resourceType,
+    mimeType,
+    uploadedAt: new Date(),
+    source: 'telegram'
+  });
+
+  return url;
 }
 
+// â”€â”€ GET /health â”€â”€
 app.get('/health', (req, res) => res.json({
   status: 'ok',
   bot: !!TELEGRAM_TOKEN,
   cloudinary: !!CLOUD_NAME,
+  mongodb: !!MONGODB_URI,
   supports: ['photos', 'videos', 'pdfs']
 }));
 
+// â”€â”€ GET /media â”€â”€ returns all media for the gallery
+app.get('/media', async (req, res) => {
+  try {
+    const database = await getDb();
+    const media = await database.collection('media')
+      .find({})
+      .sort({ uploadedAt: -1 })
+      .limit(200)
+      .toArray();
+    res.json({ success: true, count: media.length, media });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// â”€â”€ POST /webhook â”€â”€
 app.post('/webhook', async (req, res) => {
   res.json({ ok: true });
   const msg = req.body.message;
   if (!msg) return;
 
+  const caption = msg.caption || '';
   const timestamp = Date.now();
-  const caption = msg.caption || '(none)';
 
   try {
-    // â”€â”€ PHOTO â”€â”€
     if (msg.photo) {
       const best = msg.photo[msg.photo.length - 1];
       const filename = `photo_${msg.message_id}_${timestamp}`;
-      const result = await processFileFromTelegram(best.file_id, filename, 'image/jpeg');
-      console.log(`âœ… Photo uploaded: ${result.url} | Caption: ${caption}`);
+      const url = await processFile(best.file_id, filename, 'image/jpeg', caption);
+      console.log('âœ… Photo saved:', url);
       return;
     }
-
-    // â”€â”€ VIDEO â”€â”€
     if (msg.video) {
       const filename = `video_${msg.message_id}_${timestamp}`;
-      const mimeType = msg.video.mime_type || 'video/mp4';
-      const result = await processFileFromTelegram(msg.video.file_id, filename, mimeType);
-      console.log(`âœ… Video uploaded: ${result.url} | Caption: ${caption}`);
+      const url = await processFile(msg.video.file_id, filename, msg.video.mime_type || 'video/mp4', caption);
+      console.log('âœ… Video saved:', url);
       return;
     }
-
-    // â”€â”€ VIDEO NOTE (circle videos) â”€â”€
     if (msg.video_note) {
       const filename = `vidnote_${msg.message_id}_${timestamp}`;
-      const result = await processFileFromTelegram(msg.video_note.file_id, filename, 'video/mp4');
-      console.log(`âœ… Video note uploaded: ${result.url}`);
+      const url = await processFile(msg.video_note.file_id, filename, 'video/mp4', caption);
+      console.log('âœ… Video note saved:', url);
       return;
     }
-
-    // â”€â”€ DOCUMENT (PDF or other) â”€â”€
     if (msg.document) {
-      const mimeType = msg.document.mime_type || 'application/pdf';
       const filename = `doc_${msg.message_id}_${timestamp}`;
-      const result = await processFileFromTelegram(msg.document.file_id, filename, mimeType);
-      console.log(`âœ… Document uploaded: ${result.url} | Type: ${mimeType} | Caption: ${caption}`);
+      const url = await processFile(msg.document.file_id, filename, msg.document.mime_type || 'application/pdf', caption);
+      console.log('âœ… Document saved:', url);
       return;
     }
-
   } catch (err) {
-    console.error(`âŒ Upload error:`, err.message);
+    console.error('âŒ Error:', err.message);
   }
 });
 
+// â”€â”€ POST /set-webhook â”€â”€
 app.post('/set-webhook', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
@@ -163,6 +196,7 @@ app.post('/set-webhook', async (req, res) => {
   res.json(await r.json());
 });
 
+// â”€â”€ GET /bot-info â”€â”€
 app.get('/bot-info', async (req, res) => {
   const r = await fetch(`${TELEGRAM_API}/getMe`);
   res.json(await r.json());
