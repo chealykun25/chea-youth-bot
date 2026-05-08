@@ -35,16 +35,23 @@ function downloadBuffer(url) {
 // ── Helper: upload buffer to imgbb ──
 async function uploadToImgbb(buffer, filename) {
   const b64 = buffer.toString('base64');
-  const form = new URLSearchParams();
+  
+  const form = new FormData();
   form.append('key', IMGBB_KEY);
   form.append('image', b64);
   form.append('name', filename);
 
   const res = await fetch('https://api.imgbb.com/1/upload', {
     method: 'POST',
-    body: form
+    body: form,
+    headers: form.getHeaders()
   });
-  const data = await res.json();
+
+  const text = await res.text();
+  let data;
+  try { data = JSON.parse(text); } 
+  catch(e) { throw new Error('imgbb bad response: ' + text.substring(0, 200)); }
+
   if (!data.success) throw new Error('imgbb upload failed: ' + JSON.stringify(data));
   return data.data.url;
 }
