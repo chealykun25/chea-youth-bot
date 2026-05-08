@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: chea-youth-bot
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    plan: free
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: IMGBB_API_KEY
+        sync: false

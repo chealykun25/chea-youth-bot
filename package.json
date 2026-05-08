@@ -1,0 +1,18 @@
+{
+  "name": "chea-youth-bot-server",
+  "version": "1.0.0",
+  "description": "CHEA Youth Initiative — Telegram photo extractor + imgbb uploader",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "form-data": "^4.0.0",
+    "node-fetch": "^3.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
